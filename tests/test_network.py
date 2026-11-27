@@ -17,6 +17,141 @@ from doggychat.security import TLSIdentity, TrustStore
 
 
 class ChatNetworkTests(unittest.TestCase):
+    def test_room_key_is_a_host_only_four_digit_code(self):
+        network = ChatNetwork(port=0, bind_host="127.0.0.1", nickname="Host")
+
+        success, key = network.get_room_key()
+        self.assertTrue(success)
+        self.assertEqual(len(key), 4)
+        self.assertTrue(key.isascii() and key.isdigit())
+
+        self.assertEqual(network.set_room_key("0246"), (True, ""))
+        self.assertEqual(network.get_room_key(), (True, "0246"))
+        self.assertFalse(network.set_room_key("246")[0])
+        self.assertFalse(network.set_room_key("12a4")[0])
+
+        network.room_owner_id = uuid.uuid4().hex
+        self.assertFalse(network.get_room_key()[0])
+        self.assertFalse(network.set_room_key("1234")[0])
+
+    def test_new_local_room_gets_a_new_room_key(self):
+        with patch(
+            "doggychat.network.secrets.randbelow",
+            side_effect=(1234, 5678),
+        ):
+            network = ChatNetwork(
+                port=0,
+                bind_host="127.0.0.1",
+                nickname="Host",
+            )
+            self.assertEqual(network.get_room_key(), (True, "1234"))
+
+            network._reset_local_room()
+
+        self.assertEqual(network.get_room_key(), (True, "5678"))
+
+    def test_correct_room_key_joins_without_host_approval(self):
+        host = ChatNetwork(port=0, bind_host="127.0.0.1", nickname="Host")
+        guest = ChatNetwork(port=0, bind_host="127.0.0.1", nickname="Guest")
+        host.start()
+        guest.start()
+        try:
+            success, key = host.get_room_key()
+            self.assertTrue(success)
+            guest.connect_to("127.0.0.1", host.port, key=key)
+
+            event, result = self._wait_for(guest.events, "join_result")
+
+            self.assertEqual(event, "join_result")
+            self.assertTrue(result[0])
+            self.assertEqual(guest.room_id, host.room_id)
+            self.assertEqual(host.get_member_count(), 2)
+            self.assertEqual(host.get_pending_joins(), [])
+            self.assertNotIn(
+                "join_request",
+                [event for event, _ in list(host.events.queue)],
+            )
+        finally:
+            guest.close()
+            host.close()
+
+    def test_correct_room_key_is_forwarded_to_host_through_member(self):
+        host = ChatNetwork(port=0, bind_host="127.0.0.1", nickname="Host")
+        member = ChatNetwork(port=0, bind_host="127.0.0.1", nickname="Member")
+        guest = ChatNetwork(port=0, bind_host="127.0.0.1", nickname="Guest")
+        success, key = host.get_room_key()
+        self.assertTrue(success)
+        for network in (host, member, guest):
+            network.start()
+        try:
+            member.connect_to("127.0.0.1", host.port)
+            self._wait_for(host.events, "join_request")
+            self.assertTrue(host.control_join("127.0.0.1", True)[0])
+            self._wait_for(member.events, "join_result")
+
+            guest.connect_to("127.0.0.1", member.port, key=key)
+            event, result = self._wait_for(guest.events, "join_result")
+
+            self.assertEqual(event, "join_result")
+            self.assertTrue(result[0])
+            self.assertEqual(guest.room_id, host.room_id)
+            self.assertEqual(host.get_member_count(), 3)
+            self.assertEqual(host.get_pending_joins(), [])
+        finally:
+            guest.close()
+            member.close()
+            host.close()
+
+    def test_invalid_room_key_is_rejected_through_member(self):
+        host = ChatNetwork(port=0, bind_host="127.0.0.1", nickname="Host")
+        member = ChatNetwork(port=0, bind_host="127.0.0.1", nickname="Member")
+        guest = ChatNetwork(port=0, bind_host="127.0.0.1", nickname="Guest")
+        host.set_room_key("1234")
+        host.start()
+        member.start()
+        guest.start()
+        try:
+            member.connect_to("127.0.0.1", host.port)
+            self._wait_for(host.events, "join_request")
+            self.assertTrue(host.control_join("127.0.0.1", True)[0])
+            self._wait_for(member.events, "join_result")
+
+            original_room = (guest.room_id, guest.room_name)
+            guest.connect_to("127.0.0.1", member.port, key="9999")
+            event, result = self._wait_for(guest.events, "join_result")
+
+            self.assertEqual(event, "join_result")
+            self.assertFalse(result[0])
+            self.assertEqual(result[2], "Invalid room key.")
+            self.assertEqual((guest.room_id, guest.room_name), original_room)
+            self.assertEqual(host.get_member_count(), 2)
+            self.assertEqual(host.get_pending_joins(), [])
+        finally:
+            guest.close()
+            member.close()
+            host.close()
+
+    def test_invalid_room_key_is_rejected_without_pending_approval(self):
+        host = ChatNetwork(port=0, bind_host="127.0.0.1", nickname="Host")
+        guest = ChatNetwork(port=0, bind_host="127.0.0.1", nickname="Guest")
+        host.set_room_key("1234")
+        original_room = (guest.room_id, guest.room_name)
+        host.start()
+        guest.start()
+        try:
+            guest.connect_to("127.0.0.1", host.port, key="9999")
+
+            event, reason = self._wait_for(guest.events, "connection_failed")
+
+            self.assertEqual(event, "connection_failed")
+            self.assertEqual(reason, "Invalid room key.")
+            self.assertEqual(host.get_member_count(), 1)
+            self.assertEqual(host.get_pending_joins(), [])
+            self.assertEqual((guest.room_id, guest.room_name), original_room)
+        finally:
+            guest.close()
+            host.close()
+
     def test_encode_message_validates_size(self):
         with self.assertRaises(ValueError):
             encode_message("Buddy", "x" * 2001)

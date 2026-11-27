@@ -14,8 +14,12 @@ from doggychat.console import (
     _format_timestamp,
     _format_event,
     _handle_line,
+    _handle_key,
     _record_to_display,
     _render,
+    _room_member_names,
+    _scp_file_picker,
+    _scp_file_suggestions,
     run_console,
 )
 from doggychat.history import ChatHistory
@@ -33,6 +37,7 @@ class FakeNetwork:
         self.identity_id = uuid.uuid4().hex
         self.room_owner_id = uuid.uuid4().hex
         self.room_id = uuid.uuid4().hex
+        self.room_key = "1357"
         self.room_name = f"DoggyChat {VERSION} - Unknow chat room"
         self.max_members = 15
         self.room_endpoint = ("10.10.11.11", 48653)
@@ -60,8 +65,10 @@ class FakeNetwork:
     def connect_to(self, address, port):
         self.connections.append((address, port))
 
-    def connect_to_room(self, room_id):
-        self.connections.append((room_id,))
+    def connect_to_room(self, room_id, key=None):
+        self.connections.append(
+            (room_id,) if key is None else (room_id, key)
+        )
 
     def search_rooms(self):
         return list(self.rooms)
@@ -113,6 +120,19 @@ class FakeNetwork:
             "room_name": self.room_name,
             "max_members": self.max_members,
         }
+
+    def get_room_key(self):
+        if self.room_owner_id != self.identity_id:
+            return False, "Only the room host can view the room key."
+        return True, self.room_key
+
+    def set_room_key(self, key):
+        if self.room_owner_id != self.identity_id:
+            return False, "Only the room host can change the room key."
+        if not isinstance(key, str) or len(key) != 4 or not key.isascii() or not key.isdigit():
+            return False, "Room key must be exactly 4 digits."
+        self.room_key = key
+        return True, ""
 
     def set_room_config(self, room_name=None, max_members=None):
         self.config_calls.append((room_name, max_members))
@@ -281,19 +301,72 @@ class DoggyChatConsoleTests(unittest.TestCase):
 
         self.assertIn("* \x1b[94mBuddy\x1b[0m: Hello", output.getvalue())
 
-    def test_room_owner_name_is_colored_red(self):
+    def test_room_owner_name_uses_other_member_color(self):
         network = FakeNetwork()
         line = _ChatLine(
             "-",
             "Lisa",
             "Hello",
             "2026-11-26T00:00:00+00:00",
-            "red",
+            "green",
         )
         output = io.StringIO()
         _render(network, "Guest", _InputState(), [line], output)
 
-        self.assertIn("- \x1b[91mLisa\x1b[0m: Hello", output.getvalue())
+        self.assertIn("- \x1b[92mLisa\x1b[0m: Hello", output.getvalue())
+
+    def test_mentioned_nicknames_are_colored_red(self):
+        network = FakeNetwork()
+        line = _record_to_display(
+            {
+                "sender_id": uuid.uuid4().hex,
+                "nickname": "Tiger",
+                "text": "Hi @Guest, can you check this?",
+                "timestamp": "",
+            },
+            network.identity_id,
+            _room_member_names(network),
+        )
+        output = io.StringIO()
+        _render(network, "Guest", _InputState(), [line], output)
+
+        self.assertIn(
+            "Hi \x1b[91m@Guest\x1b[0m, can you check this?",
+            output.getvalue(),
+        )
+
+    def test_sender_sees_own_mentions_in_default_color(self):
+        network = FakeNetwork()
+        record = {
+            "sender_id": network.identity_id,
+            "nickname": "Guest",
+            "text": "Hi @Lisa, can you check this?",
+            "timestamp": "",
+        }
+        line = _record_to_display(record, network.identity_id, ("Lisa",))
+        output = io.StringIO()
+        _render(network, "Guest", _InputState(), [line], output)
+
+        self.assertIn(
+            "Hi @Lisa, can you check this?",
+            output.getvalue(),
+        )
+        self.assertNotIn("\x1b[91m@Lisa", output.getvalue())
+
+    def test_chat_tab_completes_and_cycles_member_mentions(self):
+        network = FakeNetwork()
+        editor = _InputState()
+        editor.text = "Hi @Li"
+        editor.cursor = len(editor.text)
+        editor.complete(lambda _message: self.fail("unexpected mention list"), network)
+        self.assertEqual(editor.text, "Hi @Lisa ")
+
+        editor.text = "@"
+        editor.cursor = len(editor.text)
+        editor.complete(lambda _message: self.fail("unexpected mention list"), network)
+        self.assertEqual(editor.text, "@Lisa ")
+        editor.complete(lambda _message: self.fail("unexpected mention list"), network)
+        self.assertEqual(editor.text, "@Tiger ")
 
     def test_non_host_name_is_colored_green(self):
         network = FakeNetwork()
@@ -310,7 +383,6 @@ class DoggyChatConsoleTests(unittest.TestCase):
 
     def test_other_users_chat_names_are_colored_green(self):
         identity_id = uuid.uuid4().hex
-        owner_id = uuid.uuid4().hex
         line = _record_to_display(
             {
                 "sender_id": uuid.uuid4().hex,
@@ -319,7 +391,7 @@ class DoggyChatConsoleTests(unittest.TestCase):
                 "timestamp": "2026-11-26T00:00:00+00:00",
             },
             identity_id,
-            owner_id,
+            ("Lisa",),
         )
         output = io.StringIO()
         _render(FakeNetwork(), "Guest", _InputState(), [line], output)
@@ -356,7 +428,7 @@ class DoggyChatConsoleTests(unittest.TestCase):
             output.getvalue(),
         )
 
-    def test_who_marks_room_owner_name_red(self):
+    def test_who_uses_own_and_other_member_colors(self):
         network = FakeNetwork()
         lines = []
         _handle_line("/who", network, "Guest", lines.append)
@@ -370,7 +442,7 @@ class DoggyChatConsoleTests(unittest.TestCase):
         )
         self.assertEqual(
             [(line.nickname, line.color) for line in users],
-            [("Lisa", "red"), ("Tiger", "green"), ("Guest", "green")],
+            [("Lisa", "green"), ("Tiger", "green"), ("Guest", "blue")],
         )
 
     def test_show_lists_current_room_configuration(self):
@@ -418,6 +490,68 @@ class DoggyChatConsoleTests(unittest.TestCase):
         self.assertEqual(
             network.connections,
             [("2",), ("2-Second room",)],
+        )
+
+    def test_control_connect_accepts_a_room_key(self):
+        network = FakeNetwork()
+        lines = []
+
+        _handle_line(
+            "/control connect 2 0420",
+            network,
+            "Guest",
+            lines.append,
+        )
+
+        self.assertEqual(network.connections, [("2", "0420")])
+        self.assertEqual(lines, ["! Connecting to room 2..."])
+
+    def test_control_connect_parses_key_after_room_name_selector(self):
+        network = FakeNetwork()
+        network.rooms.extend(
+            [
+                {
+                    "id": "id3",
+                    "room_name": "毛毛的情色小教室",
+                    "ip": "10.10.13.142",
+                    "port": 36463,
+                },
+                {
+                    "id": "id4",
+                    "room_name": "Team room 3133",
+                    "ip": "10.10.13.143",
+                    "port": 36464,
+                },
+            ]
+        )
+        lines = []
+
+        _handle_line(
+            "/control connect 3-毛毛的情色小教室 3133",
+            network,
+            "Guest",
+            lines.append,
+        )
+        _handle_line(
+            "/control connect 4-Team room 3133",
+            network,
+            "Guest",
+            lines.append,
+        )
+
+        self.assertEqual(
+            network.connections,
+            [
+                ("3-毛毛的情色小教室", "3133"),
+                ("4-Team room 3133",),
+            ],
+        )
+        self.assertEqual(
+            lines,
+            [
+                "! Connecting to room 3-毛毛的情色小教室...",
+                "! Connecting to room 4-Team room 3133...",
+            ],
         )
 
     def test_control_connect_completes_available_room_ids_in_order(self):
@@ -492,18 +626,102 @@ class DoggyChatConsoleTests(unittest.TestCase):
                     network,
                 )
                 self.assertEqual(editor.text, "/scp Lisa ~/alpha folder/")
-                editor.complete(
-                    lambda _message: self.fail("unexpected path list"),
-                    network,
-                )
+
+                editor.text = "/scp Lisa ~/"
+                editor.cursor = len(editor.text)
+                _handle_key("DOWN", editor, "Guest", network, [])
+                _handle_key("\t", editor, "Guest", network, [])
                 self.assertEqual(editor.text, "/scp Lisa ~/beta file.txt ")
+
+    def test_scp_at_tab_and_file_list_use_current_directory(self):
+        previous_directory = os.getcwd()
+        with tempfile.TemporaryDirectory() as working_directory:
+            try:
+                os.chdir(working_directory)
+                os.mkdir("folder")
+                with open("folder/inside.txt", "w", encoding="utf-8"):
+                    pass
+                for name in (
+                    "alpha.txt",
+                    "bravo.txt",
+                    "charlie.txt",
+                    "shared file.txt",
+                ):
+                    with open(name, "w", encoding="utf-8"):
+                        pass
+                network = FakeNetwork()
+                self.assertIsNone(
+                    _scp_file_picker("/scp Lisa", len("/scp Lisa"), network)
+                )
+                picker = _scp_file_picker(
+                    "/scp Lisa ", len("/scp Lisa "), network
+                )
+                self.assertIsNotNone(picker)
+                suggestions = _scp_file_suggestions(picker, 0, 80)
+                self.assertLessEqual(len(suggestions), 3)
+                self.assertIn("alpha.txt", suggestions[0][0])
+
+                editor = _InputState()
+                editor.text = "/scp Lisa "
+                editor.cursor = len(editor.text)
+                _handle_key("DOWN", editor, "Guest", network, [])
+                _handle_key("\r", editor, "Guest", network, [])
+                self.assertEqual(editor.text, "/scp Lisa bravo.txt ")
+
+                editor.text = "/scp Lisa "
+                editor.cursor = len(editor.text)
+                for _ in range(3):
+                    _handle_key("DOWN", editor, "Guest", network, [])
+                _handle_key("\t", editor, "Guest", network, [])
+                self.assertEqual(editor.text, "/scp Lisa folder/")
+
+                _handle_key("DOWN", editor, "Guest", network, [])
+                _handle_key("\t", editor, "Guest", network, [])
+                self.assertEqual(editor.text, "/scp Lisa ./")
+
+                editor.text = "/scp Lisa shared"
+                editor.cursor = len(editor.text)
+                _handle_key("\t", editor, "Guest", network, [])
+                self.assertEqual(editor.text, "/scp Lisa shared file.txt ")
+
+                editor.text = "/scp Lisa folder/"
+                editor.cursor = len(editor.text)
+                _handle_key("\r", editor, "Guest", network, [])
+                self.assertEqual(editor.text, "/scp Lisa folder/inside.txt ")
+            finally:
+                os.chdir(previous_directory)
+
+    def test_scp_enter_selects_a_file_before_sending(self):
+        network = FakeNetwork()
+        history = []
+        with tempfile.TemporaryDirectory() as working_directory:
+            previous_directory = os.getcwd()
+            try:
+                os.chdir(working_directory)
+                with open("selected.txt", "w", encoding="utf-8"):
+                    pass
+                editor = _InputState()
+                editor.text = "/scp Lisa "
+                editor.cursor = len(editor.text)
+
+                _handle_key("\r", editor, "Guest", network, history)
+                self.assertEqual(editor.text, "/scp Lisa selected.txt ")
+                self.assertEqual(network.file_transfer_calls, [])
+
+                _handle_key("\r", editor, "Guest", network, history)
+                self.assertEqual(
+                    network.file_transfer_calls,
+                    [("request", "Lisa", "selected.txt")],
+                )
+            finally:
+                os.chdir(previous_directory)
 
     def test_scp_commands_request_accept_and_cancel_transfers(self):
         network = FakeNetwork()
         lines = []
 
         _handle_line(
-            "/scp Lisa /tmp/my file.txt",
+            "/scp Lisa @/tmp/my file.txt",
             network,
             "Guest",
             lines.append,
@@ -628,7 +846,9 @@ class DoggyChatConsoleTests(unittest.TestCase):
             "Guest",
             lines.append,
         )
+        _handle_line("/manager key print", network, "Guest", lines.append)
         self.assertEqual(network.control_calls, [])
+        self.assertEqual(network.room_key, "1357")
         self.assertTrue(any("Only the room host" in line for line in lines))
 
     def test_manager_completion_is_host_only_and_nested_commands_are_ordered(self):
@@ -653,6 +873,14 @@ class DoggyChatConsoleTests(unittest.TestCase):
         editor.cursor = len(editor.text)
         editor.complete(lambda _message: self.fail("unexpected settings list"), network)
         self.assertEqual(editor.text, "/manager set maxmember ")
+        editor.text = "/manager k"
+        editor.cursor = len(editor.text)
+        editor.complete(lambda _message: self.fail("unexpected manager actions"), network)
+        self.assertEqual(editor.text, "/manager key ")
+        editor.text = "/manager key p"
+        editor.cursor = len(editor.text)
+        editor.complete(lambda _message: self.fail("unexpected key actions"), network)
+        self.assertEqual(editor.text, "/manager key print ")
 
     def test_control_commands_rename_disconnect_and_manager_set(self):
         network = FakeNetwork()
@@ -686,6 +914,20 @@ class DoggyChatConsoleTests(unittest.TestCase):
         self.assertEqual(network.room_name, "My room name")
         self.assertEqual(network.max_members, 20)
 
+    def test_host_can_print_and_set_room_key(self):
+        network = FakeNetwork()
+        network.room_owner_id = network.identity_id
+        lines = []
+
+        _handle_line("/manager key print", network, "Host", lines.append)
+        _handle_line("/manager key set 0246", network, "Host", lines.append)
+
+        self.assertEqual(network.room_key, "0246")
+        self.assertEqual(
+            lines,
+            ["! Room key: 1357", "! Room key set to 0246."],
+        )
+
     def test_help_shows_permissions_for_current_user(self):
         network = FakeNetwork()
         lines = []
@@ -701,6 +943,7 @@ class DoggyChatConsoleTests(unittest.TestCase):
         host_help = "\n".join(lines)
         self.assertIn("/manager approve <name-ip> — host only", host_help)
         self.assertIn("/manager set roomname <name> — host only", host_help)
+        self.assertIn("/manager key print — host only", host_help)
 
     def test_startup_tutorial_is_default_color(self):
         network = FakeNetwork()

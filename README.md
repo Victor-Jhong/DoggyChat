@@ -5,8 +5,8 @@ It connects directly over TCP and does not require a central server.
 
 ## Release
 
-Current version: **1.1.7**  
-Release time: **2026-11-27 12:10:42 +08:00**
+Current version: **1.2.3**
+Release time: **2026-11-27 16:19:41+08:00**
 
 DoggyChat encrypts peer connections with TLS 1.2 or newer. It uses
 trust-on-first-use (TOFU): the first certificate fingerprint for each local
@@ -85,9 +85,15 @@ For the standalone executable, pass the same options, for example
 2. Run `/control search` to list rooms visible on the LAN, then join with
    `/control connect <room id-room name>` (for example,
    `/control connect 2-My room`). Numeric IDs alone remain supported. The host
-   must approve new members with `/manager approve <name-ip>`;
-   `/manager denny <name-ip>` denies the request. The room host has one minute
-   to respond; until approval, your room ID and title remain unchanged.
+   can approve new members with `/manager approve <name-ip>` or deny them with
+   `/manager denny <name-ip>`. Alternatively, the host can share the room's
+   four-digit key, available with `/manager key print`; join using
+   `/control connect <room id> <key>` or
+   `/control connect <room id-room name> <key>` to skip manual approval. A
+   room key is created for each new room and can be changed with
+   `/manager key set <key>`.
+   Without a key, the room host has one minute to respond; until approval,
+   your room ID and title remain unchanged.
    Legacy `/control connect <ip> <port>` remains available.
    Connecting to your own room is rejected.
 3. There can be up to 50 active room IDs (`id1`–`id50`) on the same LAN
@@ -97,18 +103,20 @@ For the standalone executable, pass the same options, for example
    the limit from 1 to 100 with `/manager set maxmember <number>`.
 5. A user can connect to multiple members of the same room, but cannot connect
    to a different room until using `/control disconnect`.
-6. The default room name is `DoggyChat 1.1.7 - Unknow chat room`. The host can
+6. The default room name is `DoggyChat 1.2.3 - Unknow chat room`. The host can
    change it with `/manager set roomname <name>`; it appears in brackets at
    the top of the terminal, followed by `Room id: <number> TCP <port>`. The
    release time is shown beneath it.
 7. Nicknames must be unique regardless of letter case. Duplicate joins and
    rename attempts are rejected. If an older room contains duplicate names,
    affected users must rename before sending messages.
-8. `/who` lists the host first, followed by other users in join order. Host
-   names in chat are red, your own name is blue, and other members' names are
-   green. System messages are yellow and errors are red. Chat messages show
-   local date and time; your messages start with `*` and incoming messages
-   start with `-`.
+8. `/who` lists the host first, followed by other users in join order. Your
+   name is blue and other members' names are green, including the host.
+   Your mentions stay in the default color in messages you send; mentions in
+   received messages are red. Type `@` and press Tab to complete a room member.
+   System messages are yellow and errors are red. Chat messages show local
+   date and time; your messages start with `*` and incoming messages start
+   with `-`.
 9. New incoming messages show desktop notifications. Linux requires
    `notify-send`; Windows uses the system notification area.
 
@@ -124,37 +132,49 @@ through the local firewall.
   IP, and port.
 - `/control connect <room id-room name>` — any user; connect by the room ID
   and name shown by Tab completion. Numeric IDs alone remain supported.
+- `/control connect <room id> <key>` — any user; join a room without waiting
+  for manual host approval when the four-digit key matches.
+- `/control connect <room id-room name> <key>` — any user; the same key
+  shortcut when connecting with the ID-name selector.
 - `/control connect <ip> <port>` — any user; connect directly by endpoint.
 - `/control disconnect` — any user; leave the current room and connect to
   another.
 - `/control user rename <name>` — any user; change your nickname.
+- `@<name>` + Tab — mention a room member in a chat message; the mention is red.
 - `/manager approve <name-ip>` — host only; approve the pending request
   identified by nickname and IP.
 - `/manager denny <name-ip>` — host only; deny the pending request identified
   by nickname and IP.
 - `/manager set maxmember <number>` — host only; set the room limit (1–100).
 - `/manager set roomname <name>` — host only; change the room name.
+- `/manager key print` — host only; display this room's four-digit key.
+- `/manager key set <key>` — host only; set a new four-digit room key.
 - `/who` — any user; list the host first, then other members in join order,
   with their IP addresses.
 - `/show` — any user; show the room name, room ID and endpoint, member count,
   member limit, and history record limit.
-- `/scp <user name> <file path>` — any user; request a file transfer to one
-  member. Tab completes other members' names and local paths. The recipient
-  must run `/scp accept`.
-- `/scp all <file path>` — any user; offer the file independently to every
-  other member. Each recipient must accept separately and receives a copy.
+- `/scp <user name> <file path>` — any user; request a file transfer
+  to one member. The file picker appears automatically when the file argument
+  begins and shows up to three entries. Up/Down selects an entry and Enter
+  confirms a file; Tab opens a directory, while `..` navigates to its parent.
+  No `@` prefix is needed. The recipient must run `/scp accept`.
+- `/scp all <file path>` — any user; offer the file independently to
+  every other member. Each recipient must accept separately and receives a
+  copy.
 - `/scp accept` — any user; accept an incoming file.
 - `/scp exit` — any user; cancel the active transfer.
 - `/help` — any user; show the commands and their permissions.
 - `/quit` — any user; exit DoggyChat.
 
 Tab completes commands in order, including `/control user rename`, `/manager
-set maxmember`, `/manager set roomname`, the room ID-name selectors, and the
-host's pending name-IP choices.
-The first Tab after `/scp` lists actions and available recipients. Tab then
-completes recipients and cycles through matching files and directories;
-`~/` expands from the user's home directory. Up/Down recalls previous
-messages and commands.
+set maxmember`, `/manager set roomname`, `/manager key print`, the room
+ID-name selectors, and the host's pending name-IP choices.
+The first Tab after `/scp` lists actions and available recipients. The file
+picker opens when the recipient is followed by the file argument; Up/Down
+selects among at most three visible entries, Enter confirms the selected file,
+and Tab opens the selected directory. Select `..` and press Tab to move up.
+Direct file paths and `~/` paths remain supported. Up/Down recalls previous
+messages and commands outside the file picker.
 
 On first contact, DoggyChat automatically saves a peer's TLS certificate
 fingerprint (TOFU). If a known TLS identity presents a different certificate,

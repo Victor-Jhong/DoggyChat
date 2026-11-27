@@ -1,5 +1,4 @@
 import codecs
-import glob
 import os
 import queue
 import select
@@ -26,10 +25,12 @@ from .version import RELEASE_TIME
 COMMANDS = ("/control", "/help", "/manager", "/quit", "/scp", "/show", "/who")
 CONTROL_ACTIONS = ("connect", "disconnect", "search", "user")
 USER_ACTIONS = ("rename",)
-MANAGER_ACTIONS = ("approve", "denny", "set")
+MANAGER_ACTIONS = ("approve", "denny", "key", "set")
 MANAGER_SETTINGS = ("maxmember", "roomname")
+MANAGER_KEY_ACTIONS = ("print", "set")
 SCP_ACTIONS = ("accept", "exit")
 HEADER_SEPARATOR = "=" * 58
+MAX_SCP_PICKER_ROWS = 3
 
 
 def _room_id_number(room_id):
@@ -47,6 +48,42 @@ def _is_room_selector(value):
     return room_id.isdigit()
 
 
+def _is_bare_room_id(value):
+    normalized = value.casefold()
+    if normalized.startswith("id"):
+        normalized = normalized[2:]
+    return normalized.isdigit()
+
+
+def _normalized_room_selector(value):
+    room_id, separator, room_name = value.partition("-")
+    if not separator:
+        return value.casefold()
+    if room_id.casefold().startswith("id"):
+        room_id = room_id[2:]
+    return f"{room_id}-{room_name}".casefold()
+
+
+def _room_selector_and_key(target, rooms):
+    known_selectors = {
+        _normalized_room_selector(
+            f'{_room_id_number(room["id"])}-{room["room_name"]}'
+        )
+        for room in rooms
+    }
+    if _normalized_room_selector(target) in known_selectors:
+        return target, None
+    if " " in target:
+        selector, key = target.rsplit(maxsplit=1)
+        if (
+            key.isascii()
+            and key.isdigit()
+            and _normalized_room_selector(selector) in known_selectors
+        ):
+            return selector, key
+    return target, None
+
+
 @dataclass(frozen=True)
 class _ChatLine:
     marker: str
@@ -54,6 +91,7 @@ class _ChatLine:
     text: str
     timestamp: str = ""
     color: str = ""
+    mention_names: tuple = ()
 
 
 class _SystemMessage(str):
@@ -72,6 +110,9 @@ class _InputState:
         self.draft = ""
         self.scroll_offset = 0
         self._scp_path_cycle = None
+        self._scp_selection_key = None
+        self._scp_selection = 0
+        self._mention_cycle = None
 
     def reset(self):
         self.text = ""
@@ -80,11 +121,15 @@ class _InputState:
         self.draft = ""
         self.scroll_offset = 0
         self._scp_path_cycle = None
+        self._scp_selection_key = None
+        self._scp_selection = 0
+        self._mention_cycle = None
 
     def remember(self, line):
         self.commands.append(line)
         self.history_index = None
         self.draft = ""
+        self._mention_cycle = None
 
     def previous(self):
         if not self.commands:
@@ -113,6 +158,7 @@ class _InputState:
     def complete(self, emit, network=None):
         prefix = self.text[: self.cursor]
         if not prefix.startswith("/"):
+            self._complete_mention(prefix, network)
             return
         if " " not in prefix:
             commands = COMMANDS
@@ -161,6 +207,59 @@ class _InputState:
             remainder = prefix[len(scp_prefix) :]
             self._complete_scp(remainder, scp_prefix, emit, network)
 
+    def _complete_mention(self, prefix, network):
+        if network is None:
+            return
+        member_names = sorted(
+            (
+                user["nickname"]
+                for user in network.get_users()
+                if user["id"] != network.identity_id
+            ),
+            key=str.casefold,
+        )
+        cycle = getattr(self, "_mention_cycle", None)
+        if (
+            cycle is not None
+            and prefix == cycle["completed"]
+            and all(name in member_names for name in cycle["matches"])
+        ):
+            index = (cycle["index"] + 1) % len(cycle["matches"])
+            selected = cycle["matches"][index]
+            completed = cycle["base"] + "@" + selected + " "
+            self._apply_completion(completed)
+            cycle["index"] = index
+            cycle["completed"] = completed
+            return
+
+        mention_start = prefix.rfind("@")
+        if mention_start < 0 or (
+            mention_start > 0
+            and (
+                prefix[mention_start - 1].isalnum()
+                or prefix[mention_start - 1] == "_"
+            )
+        ):
+            return
+        current = prefix[mention_start:]
+        if any(char.isspace() for char in current):
+            return
+        matches = [
+            name
+            for name in member_names
+            if name.casefold().startswith(current[1:].casefold())
+        ]
+        if not matches:
+            return
+        completed = prefix[:mention_start] + "@" + matches[0] + " "
+        self._apply_completion(completed)
+        self._mention_cycle = {
+            "base": prefix[:mention_start],
+            "matches": matches,
+            "index": 0,
+            "completed": completed,
+        }
+
     def _complete_scp(self, remainder, base, emit, network):
         choices = list(SCP_ACTIONS) + ["all"]
         recipients = []
@@ -173,7 +272,7 @@ class _InputState:
             choices.extend(recipients)
 
         if remainder.casefold().startswith("all "):
-            self._complete_scp_path(base + "all ", remainder[4:])
+            self._complete_scp_path(network)
             return
 
         target_name = next(
@@ -185,10 +284,7 @@ class _InputState:
             None,
         )
         if target_name is not None:
-            self._complete_scp_path(
-                base + target_name + " ",
-                remainder[len(target_name) + 1 :],
-            )
+            self._complete_scp_path(network)
             return
 
         self._complete_word(
@@ -199,44 +295,41 @@ class _InputState:
             "! SCP recipients/actions: ",
         )
 
-    def _complete_scp_path(self, base, current):
-        cycle = self._scp_path_cycle
-        if (
-            cycle is not None
-            and cycle["base"] == base
-            and current in (cycle["selected"], cycle["selected"] + " ")
-        ):
-            matches = cycle["matches"]
-            selected_index = (cycle["index"] + 1) % len(matches)
+    def set_scp_picker(self, picker):
+        if self._scp_selection_key != picker["key"]:
+            self._scp_selection_key = picker["key"]
+            self._scp_selection = 0
+        if picker["entries"]:
+            self._scp_selection %= len(picker["entries"])
         else:
-            expanded = os.path.expanduser(current)
-            home = os.path.expanduser("~")
-            matches = []
-            for path in sorted(glob.glob(expanded + "*")):
-                if path == home:
-                    display_path = "~"
-                elif path.startswith(home + os.sep):
-                    display_path = "~" + path[len(home) :]
-                else:
-                    display_path = path
-                if os.path.isdir(path):
-                    display_path += os.sep
-                matches.append(display_path)
-            if not matches:
-                self._scp_path_cycle = None
-                return
-            selected_index = 0
+            self._scp_selection = 0
+        return self._scp_selection
 
-        selected = matches[selected_index]
-        self._apply_completion(
-            base + selected + ("" if selected.endswith(os.sep) else " ")
-        )
-        self._scp_path_cycle = {
-            "base": base,
-            "matches": matches,
-            "index": selected_index,
-            "selected": selected,
-        }
+    def move_scp_selection(self, picker, offset):
+        if not picker["entries"]:
+            return
+        index = self.set_scp_picker(picker)
+        self._scp_selection = (index + offset) % len(picker["entries"])
+
+    def select_scp_entry(self, picker):
+        if not picker["entries"]:
+            return
+        index = self.set_scp_picker(picker)
+        selected = picker["entries"][index]
+        path = selected["path"]
+        if selected["is_dir"]:
+            path += os.sep
+        else:
+            path += " "
+        self._apply_completion(picker["base"] + path)
+        self._scp_selection_key = None
+        self._scp_selection = 0
+
+    def _complete_scp_path(self, network):
+        picker = _scp_file_picker(self.text, self.cursor, network)
+        if picker is None or not picker["entries"]:
+            return
+        self.select_scp_entry(picker)
 
     def _complete_control(self, remainder, base, emit, network):
         if remainder == "" or " " not in remainder:
@@ -252,6 +345,9 @@ class _InputState:
         action, _, tail = remainder.partition(" ")
         if action == "connect":
             current = tail.strip()
+            tokens = current.split(maxsplit=1)
+            if len(tokens) == 2 and _is_bare_room_id(tokens[0]):
+                return
             self._complete_room_id(
                 base + "connect ", current, emit, network
             )
@@ -287,6 +383,14 @@ class _InputState:
                 MANAGER_SETTINGS,
                 emit,
                 "! Settings: ",
+            )
+        elif action == "key" and (tail == "" or " " not in tail):
+            self._complete_word(
+                base + "key ",
+                tail.rstrip(),
+                MANAGER_KEY_ACTIONS,
+                emit,
+                "! Room key actions: ",
             )
 
     def _complete_word(self, base, current, choices, emit, label):
@@ -402,15 +506,23 @@ def run_console(
         desktop_notifier.close()
 
 
+def _room_member_names(network):
+    return tuple(
+        user["nickname"]
+        for user in network.get_users()
+    )
+
+
 def _initial_history(history_store, network):
     history = deque(maxlen=2000)
     if history_store is not None:
+        member_names = _room_member_names(network)
         for record in history_store.entries():
             history.append(
                 _record_to_display(
                     record,
                     network.identity_id,
-                    network.room_owner_id,
+                    member_names,
                 )
             )
     return history
@@ -655,6 +767,10 @@ def _decode_posix_key(char, escape_sequence):
 
 def _handle_key(key, editor, nickname, network, history):
     if key in ("\r", "\n"):
+        picker = _scp_file_picker(editor.text, editor.cursor, network)
+        if picker is not None and picker["entries"]:
+            editor.select_scp_entry(picker)
+            return nickname, True, True
         line = editor.text
         if line:
             editor.remember(line)
@@ -690,10 +806,20 @@ def _handle_key(key, editor, nickname, network, history):
         editor.cursor = len(editor.text)
         return nickname, True, True
     if key == "UP":
-        editor.previous()
+        picker = _scp_file_picker(editor.text, editor.cursor, network)
+        if picker is not None:
+            if picker["entries"]:
+                editor.move_scp_selection(picker, -1)
+        else:
+            editor.previous()
         return nickname, True, True
     if key == "DOWN":
-        editor.next()
+        picker = _scp_file_picker(editor.text, editor.cursor, network)
+        if picker is not None:
+            if picker["entries"]:
+                editor.move_scp_selection(picker, 1)
+        else:
+            editor.next()
         return nickname, True, True
     if key == "PAGEUP":
         editor.scroll_offset += 10
@@ -749,14 +875,27 @@ def _handle_line(line, network, nickname, emit):
             "  /control connect <room id-room name> — any user; "
             "connect from the LAN room list"
         )
+        emit(
+            "  /control connect <room id> <key> or "
+            "<room id-room name> <key> — any user; "
+            "join without approval"
+        )
         emit("  /control search — any user; list available LAN rooms")
         emit("  /control connect <ip> <port> — any user; legacy direct connection")
         emit("  /control disconnect — any user; leave the current room")
         emit("  /control user rename <name> — any user; change your nickname")
+        emit("  @<name> + Tab — mention a room member in a chat message")
         emit("  /who — any user; list members (host first, then join order)")
         emit("  /show — any user; show room settings and member count")
-        emit("  /scp <user name> <file path> — any user; request a file transfer")
-        emit("  /scp all <file path> — any user; offer the file to every member")
+        emit(
+            "  /scp <user name> <file path> — any user; "
+            "request a file transfer"
+        )
+        emit(
+            "  /scp all <file path> — any user; "
+            "offer the file to every member"
+        )
+        emit("  File picker: Up/Down select, Enter choose, Tab browse folders")
         emit("  /scp accept — any user; accept an incoming file")
         emit("  /scp exit — any user; cancel the active transfer")
         if network.room_owner_id == network.identity_id:
@@ -764,6 +903,8 @@ def _handle_line(line, network, nickname, emit):
             emit("  /manager denny <name-ip> — host only; deny a join request")
             emit("  /manager set maxmember <number> — host only")
             emit("  /manager set roomname <name> — host only")
+            emit("  /manager key print — host only; show the room key")
+            emit("  /manager key set <key> — host only; change the 4-digit key")
         emit("  /help — any user; show this command list")
         emit("  /quit — any user; exit DoggyChat")
     elif command == "/who":
@@ -781,9 +922,7 @@ def _handle_line(line, network, nickname, emit):
                     "$",
                     user["nickname"],
                     user["ip"],
-                    color=(
-                        "red" if user["id"] == network.room_owner_id else "green"
-                    ),
+                    color="blue" if user["id"] == network.identity_id else "green",
                 )
             )
         emit("---------------------------")
@@ -844,6 +983,8 @@ def _handle_line(line, network, nickname, emit):
                     if target_name
                     else ""
                 )
+            if file_path.startswith("@"):
+                file_path = file_path[1:].strip()
             if target_name and file_path:
                 success, error = network.request_file_transfer(
                     target_name,
@@ -861,13 +1002,24 @@ def _handle_line(line, network, nickname, emit):
     elif command == "/control" or command.startswith("/control "):
         parts = command.split(maxsplit=3)
         if len(parts) in (2, 3, 4) and parts[1] == "connect":
-            target = command.split(maxsplit=2)[2] if len(parts) > 2 else ""
-            if _is_room_selector(target) or (
-                len(parts) == 3
-                and (target.isdigit() or target.casefold().startswith("id"))
-            ):
-                network.connect_to_room(target)
+            target = parts[2] if len(parts) > 2 else ""
+            if _is_bare_room_id(target):
+                key = parts[3] if len(parts) == 4 else None
+                network.connect_to_room(target, key)
                 emit(f"! Connecting to room {target}...")
+                return nickname, True
+            room_selector = (
+                command.split(maxsplit=2)[2]
+                if len(parts) > 2
+                else ""
+            )
+            if _is_room_selector(room_selector):
+                room_selector, key = _room_selector_and_key(
+                    room_selector,
+                    network.search_rooms(),
+                )
+                network.connect_to_room(room_selector, key)
+                emit(f"! Connecting to room {room_selector}...")
                 return nickname, True
             address = parts[2] if len(parts) > 2 else DEFAULT_CONNECT_IP
             remote_port = DEFAULT_PORT
@@ -907,6 +1059,8 @@ def _handle_line(line, network, nickname, emit):
         else:
             emit(
                 "! Usage: /control connect <room id-room name> | "
+                "/control connect <room id> <key> or "
+                "<room id-room name> <key> | "
                 "/control search | "
                 "/control disconnect | /control user rename <name>"
             )
@@ -955,11 +1109,30 @@ def _handle_line(line, network, nickname, emit):
                 if success
                 else f"! {error}"
             )
+        elif (
+            len(parts) == 3
+            and parts[1] == "key"
+            and parts[2] == "print"
+        ):
+            success, result = network.get_room_key()
+            emit(f"! Room key: {result}" if success else f"! {result}")
+        elif (
+            len(parts) == 4
+            and parts[1] == "key"
+            and parts[2] == "set"
+        ):
+            success, error = network.set_room_key(parts[3])
+            emit(
+                f"! Room key set to {parts[3]}."
+                if success
+                else f"! {error}"
+            )
         else:
             emit(
                 "! Usage: /manager approve <name-ip> | "
                 "/manager denny <name-ip> | "
-                "/manager set maxmember <number> | /manager set roomname <name>"
+                "/manager set maxmember <number> | /manager set roomname <name> | "
+                "/manager key print | /manager key set <4-digit key>"
             )
     elif (
         command.startswith("/connect")
@@ -1013,6 +1186,8 @@ def _drain_events(
                 "* To let others join your room:",
                 "  /manager approve <name-ip>",
                 "  /manager denny <name-ip>",
+                "  Share a key for approval-free joining: /manager key print",
+                "  Join with it using /control connect <room id> <key>",
                 "* To join another room:",
                 "  Step 1: Search for ID: /control search",
                 "  Step 2: Connect: /control connect <room id-room name>",
@@ -1043,12 +1218,13 @@ def _drain_events(
                         )
                     )
                     records = data
+            member_names = _room_member_names(network)
             for record in records:
                 emit(
                     _record_to_display(
                         record,
                         network.identity_id,
-                        network.room_owner_id,
+                        member_names,
                     )
                 )
             changed = changed or bool(records)
@@ -1072,17 +1248,12 @@ def _drain_events(
                     added = True
                 if not added:
                     continue
-                display = _record_to_display(
-                    record,
-                    network.identity_id,
-                    network.room_owner_id,
-                )
-            else:
-                display = _record_to_display(
-                    record,
-                    network.identity_id,
-                    network.room_owner_id,
-                )
+            member_names = _room_member_names(network)
+            display = _record_to_display(
+                record,
+                network.identity_id,
+                member_names,
+            )
             emit(display)
             if (
                 event == "message"
@@ -1217,20 +1388,47 @@ def _format_event(event, data):
     return ""
 
 
-def _record_to_display(record, identity_id, room_owner_id):
+def _record_to_display(record, identity_id, member_names=()):
     is_own = record["sender_id"] == identity_id
-    color = (
-        "red"
-        if record["sender_id"] == room_owner_id
-        else "blue" if is_own else "green"
-    )
+    color = "blue" if is_own else "green"
     return _ChatLine(
         "*" if is_own else "-",
         record["nickname"],
         record["text"],
         record["timestamp"],
         color,
+        () if is_own else tuple(member_names),
     )
+
+
+def _find_mention_spans(text, member_names):
+    names = sorted(set(member_names), key=len, reverse=True)
+    spans = []
+    index = 0
+    while index < len(text):
+        if text[index] != "@" or (
+            index > 0
+            and (text[index - 1].isalnum() or text[index - 1] == "_")
+        ):
+            index += 1
+            continue
+        match = None
+        for name in names:
+            end = index + 1 + len(name)
+            if text[index + 1 : end].casefold() != name.casefold():
+                continue
+            if end < len(text) and (
+                text[end].isalnum() or text[end] == "_"
+            ):
+                continue
+            match = end
+            break
+        if match is None:
+            index += 1
+            continue
+        spans.append((index, match))
+        index = match
+    return spans
 
 
 def _safe_line(line):
@@ -1335,11 +1533,24 @@ def _wrap_chat_line(message, width):
     timestamp = _format_timestamp(message.timestamp)
     prefix = f"{timestamp} " if timestamp else ""
     marker = message.marker if message.marker == "$" else f"{message.marker} "
-    segments = (
+    safe_text = _safe_line(message.text)
+    text_segments = []
+    cursor = 0
+    for start, end in _find_mention_spans(
+        safe_text, message.mention_names
+    ):
+        if start > cursor:
+            text_segments.append((safe_text[cursor:start], False))
+        text_segments.append((safe_text[start:end], "red"))
+        cursor = end
+    if cursor < len(safe_text):
+        text_segments.append((safe_text[cursor:], False))
+    segments = [
         (f"{prefix}{marker}", False),
         (_safe_line(message.nickname), message.color),
-        (": " + _safe_line(message.text), False),
-    )
+        (": ", False),
+        *text_segments,
+    ]
     lines = []
     current = []
     current_width = 0
@@ -1395,11 +1606,164 @@ def _fit_prompt(nickname, text, cursor, width):
     return prompt, cursor_column
 
 
+def _scp_file_picker(text, cursor, network):
+    prefix = text[:cursor]
+    command_prefix = "/scp "
+    if not prefix.startswith(command_prefix):
+        return None
+    remainder = prefix[len(command_prefix) :]
+    if remainder.casefold().startswith("all "):
+        base = command_prefix + "all "
+        typed_path = remainder[4:]
+    else:
+        if network is None:
+            return None
+        recipients = sorted(
+            (
+                user["nickname"]
+                for user in network.get_users()
+                if user["id"] != network.identity_id
+            ),
+            key=len,
+            reverse=True,
+        )
+        recipient = next(
+            (
+                name
+                for name in recipients
+                if remainder.casefold().startswith(name.casefold() + " ")
+            ),
+            None,
+        )
+        if recipient is None:
+            return None
+        base = command_prefix + recipient + " "
+        typed_path = remainder[len(recipient) + 1 :]
+
+    completed_path = typed_path.rstrip()
+    at_prefix = completed_path.startswith("@")
+    completed_path_text = completed_path[1:] if at_prefix else completed_path
+    if typed_path != completed_path and completed_path_text:
+        if os.path.isfile(os.path.expanduser(completed_path_text)):
+            return None
+    path_text = typed_path[1:] if typed_path.startswith("@") else typed_path
+    expanded_path = os.path.expanduser(path_text)
+    separators = (os.sep, os.altsep) if os.altsep else (os.sep,)
+    has_trailing_separator = any(
+        path_text.endswith(separator) for separator in separators
+    )
+    if has_trailing_separator:
+        directory = expanded_path or os.curdir
+        name_prefix = ""
+    else:
+        directory = os.path.dirname(expanded_path) or os.curdir
+        name_prefix = os.path.basename(expanded_path)
+    directory = os.path.normpath(directory)
+    entries = []
+    try:
+        with os.scandir(directory) as directory_entries:
+            for entry in directory_entries:
+                if not entry.name.casefold().startswith(name_prefix.casefold()):
+                    continue
+                is_dir = entry.is_dir()
+                item_path = os.path.normpath(
+                    os.path.join(directory, entry.name)
+                )
+                home = os.path.expanduser("~")
+                if item_path == home:
+                    display_path = "~"
+                elif item_path.startswith(home + os.sep):
+                    display_path = "~" + item_path[len(home) :]
+                else:
+                    display_path = item_path
+                label = _safe_line(entry.name)
+                if is_dir:
+                    label += os.sep
+                entries.append(
+                    {
+                        "label": label,
+                        "path": display_path,
+                        "is_dir": is_dir,
+                    }
+                )
+        entries.sort(key=lambda item: item["label"].casefold())
+        parent_path = os.path.normpath(os.path.join(directory, os.pardir))
+        if (
+            parent_path != directory
+            and "..".startswith(name_prefix.casefold())
+        ):
+            display_path = parent_path
+            home = os.path.expanduser("~")
+            if display_path == home:
+                display_path = "~"
+            elif display_path.startswith(home + os.sep):
+                display_path = "~" + display_path[len(home) :]
+            entries.append(
+                {
+                    "label": ".." + os.sep,
+                    "path": display_path,
+                    "is_dir": True,
+                }
+            )
+    except OSError as error:
+        return {
+            "key": (base, typed_path, str(error)),
+            "base": base,
+            "entries": [],
+            "error": _safe_line(f"File list unavailable: {error}"),
+        }
+    return {
+        "key": (base, typed_path, tuple(item["path"] for item in entries)),
+        "base": base,
+        "entries": entries,
+        "error": None,
+    }
+
+
+def _scp_file_suggestions(picker, selected_index, width):
+    if picker is None:
+        return []
+    if picker["error"]:
+        return [(_fit_line(picker["error"], width), False)]
+    entries = picker["entries"]
+    if not entries:
+        return [(_fit_line("No matching files or folders.", width), False)]
+    first = max(
+        0,
+        min(
+            selected_index - MAX_SCP_PICKER_ROWS // 2,
+            len(entries) - MAX_SCP_PICKER_ROWS,
+        ),
+    )
+    last = min(len(entries), first + MAX_SCP_PICKER_ROWS)
+    return [
+        (
+            _fit_line(
+                ("> " if index == selected_index else "  ")
+                + entries[index]["label"],
+                width,
+            ),
+            index == selected_index,
+        )
+        for index in range(first, last)
+    ]
+
+
 def _render(network, nickname, editor, history, output_stream):
     size = shutil.get_terminal_size((80, 24))
     width = max(1, size.columns or 80)
     height = max(5, size.lines or 24)
-    history_rows = max(0, height - 5)
+    picker = _scp_file_picker(editor.text, editor.cursor, network)
+    selected_index = (
+        editor.set_scp_picker(picker) if picker is not None else 0
+    )
+    file_suggestions = _scp_file_suggestions(
+        picker,
+        selected_index,
+        width,
+    )
+    suggestion_rows = min(len(file_suggestions), max(0, height - 5))
+    history_rows = max(0, height - 5 - suggestion_rows)
     wrapped_history = []
     for line in history:
         if isinstance(line, _ChatLine):
@@ -1435,17 +1799,23 @@ def _render(network, nickname, editor, history, output_stream):
     for row in range(history_rows):
         output_stream.write("\n")
         if row < len(visible_history):
-            for segment, blue in visible_history[row]:
-                if blue == "blue":
+            for segment, color in visible_history[row]:
+                if color == "blue":
                     output_stream.write(f"\x1b[94m{segment}\x1b[0m")
-                elif blue == "red":
+                elif color == "red":
                     output_stream.write(f"\x1b[91m{segment}\x1b[0m")
-                elif blue == "green":
+                elif color == "green":
                     output_stream.write(f"\x1b[92m{segment}\x1b[0m")
-                elif blue == "yellow":
+                elif color == "yellow":
                     output_stream.write(f"\x1b[93m{segment}\x1b[0m")
                 else:
                     output_stream.write(segment)
+    for suggestion, selected in file_suggestions[:suggestion_rows]:
+        output_stream.write("\n")
+        if selected:
+            output_stream.write(f"\x1b[7m{suggestion}\x1b[0m")
+        else:
+            output_stream.write(suggestion)
     output_stream.write(f"\x1b[{height};1H\x1b[2K")
     prompt, cursor_column = _fit_prompt(
         nickname, editor.text, editor.cursor, width

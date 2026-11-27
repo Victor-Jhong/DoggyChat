@@ -4,6 +4,7 @@ import ipaddress
 import json
 import os
 import queue
+import secrets
 import socket
 import ssl
 import sys
@@ -36,6 +37,19 @@ PRESENCE_TIMEOUT = 75
 SCP_TIMEOUT = 5 * 60
 SCP_CHUNK_BYTES = 8192
 JOIN_APPROVAL_TIMEOUT = 60
+
+
+def _valid_room_key(key):
+    return (
+        isinstance(key, str)
+        and len(key) == 4
+        and key.isascii()
+        and key.isdigit()
+    )
+
+
+def _new_room_key():
+    return f"{secrets.randbelow(10000):04d}"
 
 
 def create_listener(port, bind_host="0.0.0.0"):
@@ -310,7 +324,10 @@ class ChatNetwork:
         self.room_name = DEFAULT_ROOM_NAME
         self.max_members = DEFAULT_ROOM_MAX_MEMBERS
         self._config_revision = time.time_ns()
+        self._room_key_lock = threading.Lock()
+        self._room_key = _new_room_key()
         self._pending_lock = threading.Lock()
+        self._join_decision_lock = threading.Lock()
         self._pending_joins = {}
         self._pending_routes = {}
         self._seen_join_requests = set()
@@ -347,11 +364,14 @@ class ChatNetwork:
         self.events.put(("listening", self.port))
         self.events.put(("tls_fingerprint", self._tls_identity.fingerprint))
 
-    def connect_to(self, address, port=None):
+    def connect_to(self, address, port=None, key=None):
         try:
             ip = ipaddress.IPv4Address(address.strip())
         except ValueError:
             self.events.put(("error", "Enter a valid IPv4 address."))
+            return
+        if key is not None and not _valid_room_key(key):
+            self.events.put(("error", "Room key must be exactly 4 digits."))
             return
         remote_port = DEFAULT_PORT if port is None else port
         if not 1 <= remote_port <= 65535:
@@ -377,7 +397,7 @@ class ChatNetwork:
 
         threading.Thread(
             target=self._connect_worker,
-            args=(str(ip), remote_port),
+            args=(str(ip), remote_port, key),
             daemon=True,
         ).start()
 
@@ -408,9 +428,12 @@ class ChatNetwork:
             return None
         return self.room_directory.get_room_id(self.room_id)
 
-    def connect_to_room(self, room_id):
+    def connect_to_room(self, room_id, key=None):
         if self.room_directory is None:
             self.events.put(("error", "Room discovery is not available."))
+            return
+        if key is not None and not _valid_room_key(key):
+            self.events.put(("error", "Room key must be exactly 4 digits."))
             return
         room = self.room_directory.find_room(room_id)
         if room is None:
@@ -422,7 +445,7 @@ class ChatNetwork:
         if room["room_uuid"] == self.room_id:
             self.events.put(("error", "You are already in that room."))
             return
-        self.connect_to(room["ip"], room["port"])
+        self.connect_to(room["ip"], room["port"], key=key)
 
     def send(self, sender, text):
         if not self._admitted:
@@ -697,6 +720,21 @@ class ChatNetwork:
     def get_room_config(self):
         return self._room_config_snapshot()
 
+    def get_room_key(self):
+        if self.room_owner_id != self.identity_id:
+            return False, "Only the room host can view the room key."
+        with self._room_key_lock:
+            return True, self._room_key
+
+    def set_room_key(self, key):
+        if self.room_owner_id != self.identity_id:
+            return False, "Only the room host can change the room key."
+        if not _valid_room_key(key):
+            return False, "Room key must be exactly 4 digits."
+        with self._room_key_lock:
+            self._room_key = key
+        return True, ""
+
     def disconnect_from_room(self):
         should_clear_history = self._admitted
         if (
@@ -805,39 +843,56 @@ class ChatNetwork:
             )
             if request_id is None:
                 return False, f"No pending join request matching {selector}."
-            request = self._pending_joins.pop(request_id)
-            self._pending_routes.pop(request_id, None)
+        return self._decide_join_request(request_id, accepted)
 
+    def _decide_join_request(self, request_id, accepted):
+        if self.room_owner_id != self.identity_id:
+            return False, "Only the room host can control join requests."
         member = None
         duplicate_reason = ""
-        if accepted:
-            with self._members_lock:
-                duplicate_reason = self._nickname_conflict_reason_locked(
-                    request["nickname"]
-                )
-                if not duplicate_reason:
-                    member = {
-                        "id": request["user_id"],
-                        "nickname": request["nickname"],
-                        "ip": request["ip"],
-                        "port": request["port"],
-                        "order": self._next_member_order,
-                        "revision": time.time_ns(),
-                    }
-                    self._next_member_order += 1
-                    self._add_member(member)
-                    self._set_user(
-                        member["id"],
-                        member["nickname"],
-                        member["ip"],
-                        member["revision"],
-                    )
+        capacity_reason = ""
+        with self._join_decision_lock:
+            with self._pending_lock:
+                request = self._pending_joins.pop(request_id, None)
+                if request is None:
+                    return False, "The join request is no longer pending."
+                self._pending_routes.pop(request_id, None)
+
+            if accepted:
+                with self._members_lock:
+                    if len(self._members) >= self.max_members:
+                        capacity_reason = (
+                            f"Room is full ({len(self._members)}/"
+                            f"{self.max_members} members)."
+                        )
+                    else:
+                        duplicate_reason = self._nickname_conflict_reason_locked(
+                            request["nickname"]
+                        )
+                    if not duplicate_reason and not capacity_reason:
+                        member = {
+                            "id": request["user_id"],
+                            "nickname": request["nickname"],
+                            "ip": request["ip"],
+                            "port": request["port"],
+                            "order": self._next_member_order,
+                            "revision": time.time_ns(),
+                        }
+                        self._next_member_order += 1
+                        self._add_member(member)
+                        self._set_user(
+                            member["id"],
+                            member["nickname"],
+                            member["ip"],
+                            member["revision"],
+                        )
+        decision_reason = duplicate_reason or capacity_reason
         decision = {
             "type": "join_decision",
             "request_id": request_id,
-            "accepted": accepted and not duplicate_reason,
+            "accepted": accepted and not decision_reason,
             "member": member,
-            "reason": duplicate_reason,
+            "reason": decision_reason,
         }
         self._seen_join_decisions.add(request_id)
         encoded = _encode_frame(decision)
@@ -847,23 +902,41 @@ class ChatNetwork:
         pending_peer = request.get("peer")
         if pending_peer is not None:
             self._send_peer(pending_peer, encoded)
-            if accepted and not duplicate_reason:
+            if accepted and not decision_reason:
                 self._activate_peer(pending_peer)
             else:
                 self._remove_peer(
                     pending_peer,
-                    "Nickname conflict" if duplicate_reason else "Join request denied",
+                    "Nickname conflict"
+                    if duplicate_reason
+                    else "Join request denied",
                 )
-        elif accepted and not duplicate_reason:
+        elif accepted and not decision_reason:
             self._send_history_to_member(member["id"])
+        if capacity_reason:
+            self.events.put(
+                (
+                    "join_capacity",
+                    (
+                        request["nickname"],
+                        request["ip"],
+                        self.get_member_count(),
+                        self.max_members,
+                    ),
+                )
+            )
         self.events.put(
             (
                 "join_decision",
-                (request["nickname"], request["ip"], accepted and not duplicate_reason),
+                (
+                    request["nickname"],
+                    request["ip"],
+                    accepted and not decision_reason,
+                ),
             )
         )
-        if duplicate_reason:
-            return False, duplicate_reason
+        if decision_reason:
+            return False, decision_reason
         return True, ""
 
     def close(self):
@@ -936,7 +1009,7 @@ class ChatNetwork:
             return
         self._register_peer(tls_connection, address)
 
-    def _connect_worker(self, address, port):
+    def _connect_worker(self, address, port, key=None):
         try:
             raw_connection = socket.create_connection((address, port), timeout=5)
             connection = self._client_tls_context.wrap_socket(
@@ -952,9 +1025,14 @@ class ChatNetwork:
             connection.close()
             self._finish_connect_attempt()
             return
-        self._register_peer(connection, (address, port), initiated=True)
+        self._register_peer(
+            connection,
+            (address, port),
+            initiated=True,
+            join_key=key,
+        )
 
-    def _register_peer(self, connection, address, initiated=False):
+    def _register_peer(self, connection, address, initiated=False, join_key=None):
         server_certificate = (
             connection.getpeercert(binary_form=True)
             if initiated
@@ -975,7 +1053,6 @@ class ChatNetwork:
         if local_ip and local_ip != self._local_ip:
             self._local_ip = local_ip
             self._publish_local_presence()
-        threading.Thread(target=self._read_peer, args=(peer,), daemon=True).start()
         hello = {
             "type": "hello",
             "id": self.identity_id,
@@ -992,7 +1069,14 @@ class ChatNetwork:
                 self.port,
             ),
         }
-        self._send_peer(peer, _encode_frame(hello))
+        if join_key is not None:
+            hello["join_key"] = join_key
+        if self._send_peer(peer, _encode_frame(hello)):
+            threading.Thread(
+                target=self._read_peer,
+                args=(peer,),
+                daemon=True,
+            ).start()
 
     def _read_peer(self, peer):
         buffered = bytearray()
@@ -1093,6 +1177,7 @@ class ChatNetwork:
         room_owner_id = frame.get("room_owner_id")
         request_id = frame.get("request_id")
         listen_port = frame.get("port")
+        join_key = frame.get("join_key")
         members = _validate_members(frame.get("members"))
         room_config = _validate_room_config(frame)
         if (
@@ -1145,6 +1230,9 @@ class ChatNetwork:
             self.events.put(
                 ("tls_peer_trusted", (nickname.strip(), fingerprint))
             )
+        if join_key is not None and not _valid_room_key(join_key):
+            self._reject_connection(peer, "Room key must be exactly 4 digits.")
+            return
         local_members = self._member_ids()
         if peer.initiated and len(local_members) > 1:
             if room_config["room_id"] != self.room_id:
@@ -1193,6 +1281,15 @@ class ChatNetwork:
             return
 
         if self.room_owner_id == self.identity_id:
+            if join_key is not None:
+                with self._room_key_lock:
+                    key_matches = secrets.compare_digest(
+                        join_key,
+                        self._room_key,
+                    )
+                if not key_matches:
+                    self._reject_connection(peer, "Invalid room key.")
+                    return
             duplicate_reason = self._nickname_conflict_reason(peer.nickname)
             if duplicate_reason:
                 self.events.put(
@@ -1217,7 +1314,10 @@ class ChatNetwork:
                 peer.address[0],
                 peer.listen_port,
                 peer,
+                notify=join_key is None,
             )
+            if join_key is not None:
+                self._decide_join_request(request_id, True)
         else:
             self._send_peer(
                 peer,
@@ -1232,6 +1332,7 @@ class ChatNetwork:
                 peer.address[0],
                 peer.listen_port,
                 exclude=peer.connection,
+                join_key=join_key,
             )
 
     def _handle_room_owner(self, frame, peer):
@@ -1254,6 +1355,9 @@ class ChatNetwork:
             return
         self._replace_room_members(members)
         self.room_owner_id = room_owner_id
+        if room_owner_id == self.identity_id:
+            with self._room_key_lock:
+                self._room_key = _new_room_key()
         self._apply_room_config(room_config)
         nickname = members[room_owner_id]["nickname"]
         self.events.put(("room_owner_changed", nickname))
@@ -1277,6 +1381,7 @@ class ChatNetwork:
         nickname = frame.get("nickname")
         address = frame.get("ip")
         listen_port = frame.get("port")
+        join_key = frame.get("join_key")
         if (
             not _valid_uuid(request_id)
             or not _valid_uuid(user_id)
@@ -1292,7 +1397,25 @@ class ChatNetwork:
         address = str(ipaddress.IPv4Address(address))
         if user_id in self._member_ids():
             return
+        if join_key is not None and not _valid_room_key(join_key):
+            self._reject_join_request(
+                request_id,
+                "Room key must be exactly 4 digits.",
+            )
+            return
         if self.room_owner_id == self.identity_id:
+            if join_key is not None:
+                with self._room_key_lock:
+                    key_matches = secrets.compare_digest(
+                        join_key,
+                        self._room_key,
+                    )
+                if not key_matches:
+                    self._reject_join_request(
+                        request_id,
+                        "Invalid room key.",
+                    )
+                    return
             duplicate_reason = self._nickname_conflict_reason(nickname)
             if duplicate_reason:
                 self._reject_duplicate_join_request(
@@ -1312,7 +1435,10 @@ class ChatNetwork:
                 address,
                 listen_port,
                 None,
+                notify=join_key is None,
             )
+            if join_key is not None:
+                self._decide_join_request(request_id, True)
             return
         self._forward_join_request(
             request_id,
@@ -1321,6 +1447,7 @@ class ChatNetwork:
             address,
             listen_port,
             exclude=peer.connection,
+            join_key=join_key,
         )
 
     def _handle_join_decision(self, frame, peer):
@@ -1482,8 +1609,10 @@ class ChatNetwork:
             return
         peer.departed = True
         self._remove_peer(peer, "Connection rejected")
-        if not self._admitted:
-            self._reset_local_room()
+        if peer.pending_room_snapshot is not None:
+            peer.pending_room_snapshot = None
+            peer.join_deadline = None
+            self._admitted = True
         self.events.put(("connection_failed", reason))
 
     def _handle_scp_request(self, frame, peer):
@@ -2048,6 +2177,7 @@ class ChatNetwork:
         address,
         listen_port,
         peer,
+        notify=True,
     ):
         address = str(ipaddress.IPv4Address(address))
         if user_id in self._member_ids():
@@ -2067,14 +2197,15 @@ class ChatNetwork:
             self._pending_joins[request_id] = request
             if peer is not None:
                 self._pending_routes[request_id] = peer
-        if peer is not None:
+        if peer is not None and notify:
             self._send_peer(
                 peer,
                 _encode_frame(
                     {"type": "join_pending", "nickname": self.nickname}
                 ),
             )
-        self.events.put(("join_request", (nickname, address)))
+        if notify:
+            self.events.put(("join_request", (nickname, address)))
 
     def _forward_join_request(
         self,
@@ -2084,24 +2215,23 @@ class ChatNetwork:
         address,
         listen_port,
         exclude=None,
+        join_key=None,
     ):
         with self._pending_lock:
             if request_id in self._seen_join_requests:
                 return
             self._seen_join_requests.add(request_id)
-        self._broadcast(
-            _encode_frame(
-                {
-                    "type": "join_request",
-                    "request_id": request_id,
-                    "user_id": user_id,
-                    "nickname": nickname,
-                    "ip": address,
-                    "port": listen_port,
-                }
-            ),
-            exclude=exclude,
-        )
+        frame = {
+            "type": "join_request",
+            "request_id": request_id,
+            "user_id": user_id,
+            "nickname": nickname,
+            "ip": address,
+            "port": listen_port,
+        }
+        if join_key is not None:
+            frame["join_key"] = join_key
+        self._broadcast(_encode_frame(frame), exclude=exclude)
 
     def _adopt_room_snapshot(self, room_owner_id, members, room_config):
         if room_owner_id not in members:
@@ -2149,6 +2279,8 @@ class ChatNetwork:
         self.room_owner_id = self.identity_id
         self.room_id = uuid.uuid4().hex
         self._admitted = True
+        with self._room_key_lock:
+            self._room_key = _new_room_key()
         with self._config_lock:
             self.room_name = DEFAULT_ROOM_NAME
             self.max_members = DEFAULT_ROOM_MAX_MEMBERS
@@ -2249,6 +2381,24 @@ class ChatNetwork:
                 (nickname, address, current_members, self.max_members),
             )
         )
+        self._broadcast(
+            _encode_frame(
+                {
+                    "type": "join_decision",
+                    "request_id": request_id,
+                    "accepted": False,
+                    "member": None,
+                    "reason": reason,
+                }
+            )
+        )
+
+    def _reject_join_request(self, request_id, reason):
+        with self._pending_lock:
+            if request_id in self._seen_join_requests:
+                return
+            self._seen_join_requests.add(request_id)
+            self._seen_join_decisions.add(request_id)
         self._broadcast(
             _encode_frame(
                 {

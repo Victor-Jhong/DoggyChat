@@ -1,5 +1,45 @@
 # DoggyChat Changelog
 
+## 1.2.3 — 2026-11-27 16:19:41 +08:00
+
+- Include the local user's nickname when detecting received mentions, so the
+  person being tagged sees their name highlighted red.
+
+## 1.2.2 — 2026-11-27 16:12:51 +08:00
+
+- Keep `@mentions` in the default color for the sender; highlight them red in
+  recipients' received messages.
+
+## 1.2.1 — 2026-11-27 16:09:29 +08:00
+
+- Parse a four-digit key after an ID-name room selector as the key argument,
+  rather than including it in the room name. Exact room names ending in four
+  digits remain valid.
+
+## 1.2.0 — 2026-11-27 15:52:10 +08:00
+
+- Show the SCP file picker only after the recipient, when the file argument
+  begins. It displays at most three entries; Up/Down selects and Enter confirms
+  a file, while Tab enters a directory or opens `..` to move to its parent.
+- File selection no longer requires an `@` prefix.
+
+## 1.1.9 — 2026-11-27 14:51:47 +08:00
+
+- Add `@` + Tab completion for room members; mentioned names are highlighted
+  red, while chat and `/who` colors distinguish only the local user from others.
+- Show current-folder entries above the prompt while entering `/scp`, with
+  `@` + Tab completion for local files and directories.
+
+## 1.1.8 — 2026-11-27 14:32:13 +08:00
+
+- Generate a random four-digit key for each new room. Hosts can view or change
+  it with `/manager key print` and `/manager key set <key>`.
+- Allow `/control connect <room id> <key>` to join without manual approval;
+  invalid keys are rejected, including when the request is relayed through a
+  room member.
+- Preserve the local room identity and title when a connection is rejected
+  before approval.
+
 ## 1.1.7 — 2026-11-27 12:10:42 +08:00
 
 - Display the default-color usage hint every time DoggyChat starts, rather than
